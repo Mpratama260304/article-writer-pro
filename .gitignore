@@ -3,3 +3,5 @@ dist/
 database/*.db
 .env
 *.log
+database/*.db-shm
+database/*.db-wal

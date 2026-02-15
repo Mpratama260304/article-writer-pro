@@ -9,7 +9,8 @@
     "dev:client": "vite",
     "build": "vite build",
     "start": "NODE_ENV=production node server/index.js",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node tests/sanity.test.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",
@@ -18,7 +19,8 @@
     "express": "^4.21.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.28.0"
+    "react-router-dom": "^6.28.0",
+    "turndown": "^7.2.2"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

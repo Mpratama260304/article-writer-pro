@@ -16,6 +16,15 @@ const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+// ── Migration helper: add column if it doesn't exist ──
+function addColumnIfMissing(table, column, definition) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.find((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    console.log(`Migration: added ${table}.${column}`);
+  }
+}
+
 function initialize() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS projects (
@@ -32,6 +41,9 @@ function initialize() {
       title TEXT DEFAULT '',
       keyword TEXT NOT NULL,
       content TEXT DEFAULT '',
+      slug TEXT DEFAULT '',
+      excerpt TEXT DEFAULT '',
+      tags TEXT DEFAULT '[]',
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending','generating','completed','failed')),
       error_message TEXT DEFAULT '',
       language TEXT DEFAULT 'Indonesian',
@@ -63,7 +75,36 @@ function initialize() {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      status TEXT DEFAULT 'running' CHECK(status IN ('running','completed','canceled','failed')),
+      total INTEGER DEFAULT 0,
+      completed INTEGER DEFAULT 0,
+      failed INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS job_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      keyword TEXT NOT NULL,
+      status TEXT DEFAULT 'waiting' CHECK(status IN ('waiting','generating','completed','failed','canceled')),
+      article_id INTEGER,
+      error_message TEXT DEFAULT '',
+      started_at DATETIME,
+      finished_at DATETIME,
+      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+      FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE SET NULL
+    );
   `);
+
+  // ── Run migrations for existing databases ──
+  addColumnIfMissing('articles', 'slug', "TEXT DEFAULT ''");
+  addColumnIfMissing('articles', 'excerpt', "TEXT DEFAULT ''");
+  addColumnIfMissing('articles', 'tags', "TEXT DEFAULT '[]'");
 
   // Seed default settings
   const defaultSettings = [

@@ -1,21 +1,97 @@
 import archiver from 'archiver';
+import TurndownService from 'turndown';
 
-function generateWordPressXML(articles, projectName) {
+// ── Helpers ──
+
+/** Make CDATA safe by splitting the ]]> sequence */
+function cdataSafe(str) {
+  if (!str) return '';
+  return str.replace(/\]\]>/g, ']]]]><![CDATA[>');
+}
+
+/** Map language name → ISO 639-1 code */
+function langCode(language) {
+  const map = {
+    indonesian: 'id', indonesia: 'id',
+    english: 'en', inggris: 'en',
+    spanish: 'es', spanyol: 'es',
+    french: 'fr', prancis: 'fr',
+    german: 'de', jerman: 'de',
+    portuguese: 'pt',
+    italian: 'it',
+    dutch: 'nl',
+    japanese: 'ja', jepang: 'ja',
+    korean: 'ko',
+    chinese: 'zh',
+    arabic: 'ar', arab: 'ar',
+    russian: 'ru', rusia: 'ru',
+    turkish: 'tr', turki: 'tr',
+    thai: 'th',
+    vietnamese: 'vi', vietnam: 'vi',
+    malay: 'ms', melayu: 'ms',
+  };
+  return map[(language || '').toLowerCase().trim()] || 'en';
+}
+
+/** Derive a slug from article (prefer stored slug, then title) */
+function articleSlug(article) {
+  if (article.slug) return article.slug;
+  const base = article.title || article.keyword || 'article';
+  return base
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '') || 'article';
+}
+
+/** Parse tags from article.tags (JSON string or empty) */
+function parseTags(article) {
+  if (!article.tags) return [];
+  try { return JSON.parse(article.tags); } catch { return []; }
+}
+
+// ── WordPress WXR Export ──
+
+function generateWordPressXML(articles, projectName, language) {
   const now = new Date().toUTCString();
+  const lang = langCode(language);
+
   const items = articles
-    .map((a) => {
-      const pubDate = new Date(a.created_at).toUTCString();
-      const escapedContent = `<![CDATA[${a.content || ''}]]>`;
-      const escapedTitle = `<![CDATA[${a.title || a.keyword}]]>`;
+    .map((a, idx) => {
+      const slug = articleSlug(a);
+      const postDate = a.created_at || new Date().toISOString();
+      const gmtDate = new Date(postDate).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+      const tags = parseTags(a);
+
+      const tagNodes = tags
+        .map(
+          (t) =>
+            `      <category domain="post_tag" nicename="${t
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '-')
+              .replace(/^-|-$/g, '')}"><![CDATA[${cdataSafe(t)}]]></category>`
+        )
+        .join('\n');
+
+      const categoryNode = projectName
+        ? `      <category domain="category" nicename="${projectName
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-|-$/g, '')}"><![CDATA[${cdataSafe(projectName)}]]></category>`
+        : '';
+
       return `
     <item>
-      <title>${escapedTitle}</title>
+      <title><![CDATA[${cdataSafe(a.title || a.keyword)}]]></title>
       <dc:creator><![CDATA[admin]]></dc:creator>
-      <content:encoded>${escapedContent}</content:encoded>
-      <wp:post_date><![CDATA[${a.created_at}]]></wp:post_date>
+      <content:encoded><![CDATA[${cdataSafe(a.content || '')}]]></content:encoded>
+      <excerpt:encoded><![CDATA[${cdataSafe(a.excerpt || '')}]]></excerpt:encoded>
+      <wp:post_id>${a.id || idx + 1}</wp:post_id>
+      <wp:post_date><![CDATA[${postDate}]]></wp:post_date>
+      <wp:post_date_gmt><![CDATA[${gmtDate}]]></wp:post_date_gmt>
+      <wp:post_name><![CDATA[${slug}]]></wp:post_name>
       <wp:post_type><![CDATA[post]]></wp:post_type>
-      <wp:status><![CDATA[draft]]></wp:status>
-    </item>`;
+      <wp:status><![CDATA[publish]]></wp:status>
+${categoryNode ? categoryNode + '\n' : ''}${tagNodes ? tagNodes + '\n' : ''}    </item>`;
     })
     .join('\n');
 
@@ -31,67 +107,101 @@ function generateWordPressXML(articles, projectName) {
   <link>https://example.com</link>
   <description>Exported from ArticleWriterPro</description>
   <pubDate>${now}</pubDate>
-  <language>en</language>
+  <language>${lang}</language>
   <wp:wxr_version>1.2</wp:wxr_version>
   ${items}
 </channel>
 </rss>`;
 }
 
+// ── HTML ZIP Export ──
+
 function createHTMLZip(articles, template, res) {
   const archive = archiver('zip', { zlib: { level: 9 } });
   archive.pipe(res);
 
-  articles.forEach((article, i) => {
-    const html = template
-      .replace(/{{title}}/g, article.title || article.keyword)
-      .replace(/{{content}}/g, article.content || '')
-      .replace(/{{keyword}}/g, article.keyword)
-      .replace(/{{date}}/g, new Date(article.created_at).toLocaleDateString())
-      .replace(/{{author}}/g, 'ArticleWriterPro');
+  // Build per-article pages
+  const tocEntries = [];
 
-    const slug = (article.title || article.keyword)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '');
-    archive.append(html, { name: `${String(i + 1).padStart(3, '0')}-${slug}.html` });
+  articles.forEach((article) => {
+    const slug = articleSlug(article);
+    const title = article.title || article.keyword;
+
+    tocEntries.push({ slug, title });
+
+    const html = template
+      .replace(/\{\{title\}\}/g, title)
+      .replace(/\{\{content\}\}/g, article.content || '')
+      .replace(/\{\{keyword\}\}/g, article.keyword)
+      .replace(/\{\{date\}\}/g, new Date(article.created_at).toLocaleDateString())
+      .replace(/\{\{author\}\}/g, 'ArticleWriterPro');
+
+    archive.append(html, { name: `articles/${slug}/index.html` });
   });
+
+  // Build index.html
+  const links = tocEntries
+    .map((e) => `  <li><a href="articles/${e.slug}/index.html">${escapeHtml(e.title)}</a></li>`)
+    .join('\n');
+  const indexHtml = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Article Index</title></head>
+<body>
+<h1>Articles</h1>
+<ul>
+${links}
+</ul>
+<p><em>Generated by ArticleWriterPro</em></p>
+</body>
+</html>`;
+  archive.append(indexHtml, { name: 'index.html' });
 
   archive.finalize();
 }
 
+/** Minimal HTML entity escaping for safe display in index */
+function escapeHtml(str) {
+  return (str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ── Markdown ZIP Export ──
+
 function createMarkdownZip(articles, res) {
+  const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
   const archive = archiver('zip', { zlib: { level: 9 } });
   archive.pipe(res);
 
-  articles.forEach((article, i) => {
-    // Convert simple HTML to markdown-ish
-    let md = `# ${article.title || article.keyword}\n\n`;
+  const fileList = [];
+
+  articles.forEach((article) => {
+    const slug = articleSlug(article);
+    const title = article.title || article.keyword;
+    const filename = `${slug}.md`;
+    fileList.push({ filename, title });
+
+    let md = `# ${title}\n\n`;
     md += `**Keyword:** ${article.keyword}\n`;
     md += `**Date:** ${new Date(article.created_at).toLocaleDateString()}\n\n`;
     md += `---\n\n`;
 
-    let content = article.content || '';
-    content = content
-      .replace(/<h2[^>]*>(.*?)<\/h2>/gi, '\n## $1\n')
-      .replace(/<h3[^>]*>(.*?)<\/h3>/gi, '\n### $1\n')
-      .replace(/<p[^>]*>(.*?)<\/p>/gi, '$1\n\n')
-      .replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n')
-      .replace(/<ul[^>]*>|<\/ul>|<ol[^>]*>|<\/ol>/gi, '\n')
-      .replace(/<strong>(.*?)<\/strong>/gi, '**$1**')
-      .replace(/<em>(.*?)<\/em>/gi, '*$1*')
-      .replace(/<[^>]+>/g, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
+    // Use turndown for proper HTML → Markdown conversion
+    const content = article.content || '';
+    md += td.turndown(content);
 
-    md += content;
-
-    const slug = (article.title || article.keyword)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '');
-    archive.append(md, { name: `${String(i + 1).padStart(3, '0')}-${slug}.md` });
+    archive.append(md, { name: filename });
   });
+
+  // Root README.md listing all files
+  let readme = `# Exported Articles\n\n`;
+  readme += `Generated by **ArticleWriterPro**\n\n`;
+  readme += `## Files\n\n`;
+  readme += fileList.map((f) => `- [${f.title}](${f.filename})`).join('\n');
+  readme += '\n';
+  archive.append(readme, { name: 'README.md' });
 
   archive.finalize();
 }

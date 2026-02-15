@@ -1,3 +1,35 @@
+// ── Shared text utilities ──
+
+/** Generate a URL-safe slug from text, falling back to fallbackText */
+function slugify(text, fallbackText = '') {
+  const source = (text || fallbackText || '').toString();
+  return source
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 200) || 'untitled';
+}
+
+/** Strip HTML tags and collapse whitespace */
+function stripHtml(html) {
+  return (html || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** Count words in plain text */
+function wordCount(plainText) {
+  const t = (plainText || '').trim();
+  return t ? t.split(/\s+/).length : 0;
+}
+
+/** Create an excerpt of `maxLen` chars from plain text */
+function makeExcerpt(plainText, maxLen = 160) {
+  const t = (plainText || '').trim();
+  if (t.length <= maxLen) return t;
+  return t.slice(0, maxLen).replace(/\s+\S*$/, '') + '…';
+}
+
+// ── AI config ──
+
 const DEFAULT_CONFIG = {
   apiBaseUrl: 'https://ark.ap-southeast.bytepluses.com/api/v3',
   apiKey: 'd88c479d-a74d-4040-91df-207bcd94b4a4',
@@ -16,12 +48,43 @@ function buildPrompt(template, keyword, language, tone, length) {
     .replace(/{length}/g, wordCount);
 }
 
-function parseAIResponse(text) {
+// ── Resilient AI response parser ──
+
+function parseAIResponse(text, originalKeyword) {
+  // 1) Try JSON parse first
+  let jsonResult = null;
+  try {
+    // Strip markdown code fences if model wrapped output
+    const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    jsonResult = JSON.parse(cleaned);
+  } catch {
+    // Also try to extract JSON from within the text
+    const jsonMatch = text.match(/\{[\s\S]*"content_html"[\s\S]*\}/);
+    if (jsonMatch) {
+      try { jsonResult = JSON.parse(jsonMatch[0]); } catch { /* ignore */ }
+    }
+  }
+
+  if (jsonResult && typeof jsonResult === 'object') {
+    const title = (jsonResult.title || '').trim();
+    const contentHtml = (jsonResult.content_html || jsonResult.content || '').trim();
+    const plain = stripHtml(contentHtml);
+    return {
+      title: title || originalKeyword,
+      keyword: (jsonResult.keyword || originalKeyword || '').trim(),
+      slug: slugify(title, originalKeyword),
+      tags: Array.isArray(jsonResult.tags) ? jsonResult.tags : [],
+      excerpt: (jsonResult.excerpt || '').trim() || makeExcerpt(plain),
+      content: contentHtml,
+      wordCount: wordCount(plain),
+    };
+  }
+
+  // 2) Fallback: legacy TITLE / KEYWORD / CONTENT format
   let title = '';
-  let keyword = '';
+  let keyword = originalKeyword || '';
   let content = '';
 
-  // Try to parse structured response
   const titleMatch = text.match(/TITLE:\s*(.+)/i);
   const keywordMatch = text.match(/KEYWORD:\s*(.+)/i);
   const contentMatch = text.match(/CONTENT:\s*([\s\S]+)/i);
@@ -30,21 +93,25 @@ function parseAIResponse(text) {
   if (keywordMatch) keyword = keywordMatch[1].trim();
   if (contentMatch) content = contentMatch[1].trim();
 
-  // Fallback: if no structured format, use the whole text as content
+  // 3) Fallback: use the entire text as content
   if (!content) {
     content = text;
-    // Try to extract a title from the first line or first heading
     const h1Match = text.match(/<h1[^>]*>(.*?)<\/h1>/i);
-    const firstLineMatch = text.match(/^#\s+(.+)/m);
+    const mdH1 = text.match(/^#\s+(.+)/m);
     if (h1Match) title = h1Match[1].trim();
-    else if (firstLineMatch) title = firstLineMatch[1].trim();
+    else if (mdH1) title = mdH1[1].trim();
   }
 
-  // Count words
-  const plainText = content.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  const wordCount = plainText ? plainText.split(/\s+/).length : 0;
-
-  return { title, keyword, content, wordCount };
+  const plain = stripHtml(content);
+  return {
+    title: title || originalKeyword,
+    keyword,
+    slug: slugify(title, originalKeyword),
+    tags: [],
+    excerpt: makeExcerpt(plain),
+    content,
+    wordCount: wordCount(plain),
+  };
 }
 
 async function generateArticle(keyword, promptTemplate, language, tone, length, config = {}) {
@@ -88,7 +155,7 @@ async function generateArticle(keyword, promptTemplate, language, tone, length, 
   }
 
   const rawContent = data.choices[0].message.content;
-  return parseAIResponse(rawContent);
+  return parseAIResponse(rawContent, keyword);
 }
 
 async function testConnection(config = {}) {
@@ -116,4 +183,14 @@ async function testConnection(config = {}) {
   return data.choices[0].message.content;
 }
 
-export { generateArticle, testConnection, DEFAULT_CONFIG, buildPrompt, parseAIResponse };
+export {
+  generateArticle,
+  testConnection,
+  DEFAULT_CONFIG,
+  buildPrompt,
+  parseAIResponse,
+  slugify,
+  stripHtml,
+  wordCount,
+  makeExcerpt,
+};

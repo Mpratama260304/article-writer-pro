@@ -40,6 +40,54 @@ The development server runs on:
 - Frontend: http://localhost:5173
 - Backend API: http://localhost:3001
 
+## Docker
+
+### Build & Run with Docker Compose (recommended)
+
+```bash
+# Start in production mode (builds image automatically)
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+The app will be available at **http://localhost:3001**. The SQLite database is persisted in the `./database/` directory on the host.
+
+### Build Image Manually
+
+```bash
+# Build
+docker build -t your-username/articlewriterpro:latest .
+
+# Run
+docker run -d \
+  --name articlewriterpro \
+  -p 3001:3001 \
+  -v $(pwd)/database:/app/database \
+  -e NODE_ENV=production \
+  your-username/articlewriterpro:latest
+```
+
+### Push to DockerHub
+
+```bash
+docker login
+docker tag your-username/articlewriterpro:latest your-username/articlewriterpro:latest
+docker push your-username/articlewriterpro:latest
+```
+
+### Development with Docker
+
+```bash
+docker compose -f docker-compose.dev.yml up
+```
+
+This mounts the source code as a volume and runs both Vite and Express in dev mode with hot reload.
+
 ## Available Models
 
 | Model Name | Model ID |

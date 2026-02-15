@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useToast } from '../components/Toast';
 
@@ -9,6 +9,8 @@ const LENGTHS = [
   { value: 'medium', label: 'Medium (~1000 words)' },
   { value: 'long', label: 'Long (~2000 words)' },
 ];
+
+const STORAGE_KEY = 'awp_active_job';
 
 export default function Generator() {
   const [searchParams] = useSearchParams();
@@ -25,8 +27,11 @@ export default function Generator() {
   const [promptId, setPromptId] = useState('');
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
   const [total, setTotal] = useState(0);
+  const [jobId, setJobId] = useState(null);
+  const [jobStatus, setJobStatus] = useState(null); // running | completed | canceled | failed
+
+  const eventSourceRef = useRef(null);
 
   useEffect(() => {
     fetch('/api/projects').then((r) => r.json()).then(setProjects).catch(() => {});
@@ -35,7 +40,138 @@ export default function Generator() {
       const def = data.find((p) => p.is_default);
       if (def) setPromptId(String(def.id));
     }).catch(() => {});
-  }, []);
+
+    // Resume from localStorage if there's an active job
+    const savedJobId = localStorage.getItem(STORAGE_KEY);
+    if (savedJobId) {
+      resumeJob(parseInt(savedJobId));
+    }
+
+    return () => {
+      if (eventSourceRef.current) eventSourceRef.current.close();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Connect SSE to a job
+  const connectSSE = (jid) => {
+    if (eventSourceRef.current) eventSourceRef.current.close();
+
+    const es = new EventSource(`/api/generate/stream/${jid}`);
+    eventSourceRef.current = es;
+
+    es.addEventListener('job_started', (e) => {
+      const data = JSON.parse(e.data);
+      setTotal(data.total);
+      setJobStatus(data.status);
+    });
+
+    es.addEventListener('item_started', (e) => {
+      const data = JSON.parse(e.data);
+      setProgress((prev) => {
+        const updated = [...prev];
+        const idx = updated.findIndex((p) => p.itemId === data.itemId || p.keyword === data.keyword);
+        if (idx >= 0) {
+          updated[idx] = { ...updated[idx], status: 'generating', itemId: data.itemId };
+        }
+        return updated;
+      });
+    });
+
+    es.addEventListener('item_completed', (e) => {
+      const data = JSON.parse(e.data);
+      setProgress((prev) => {
+        const updated = [...prev];
+        const idx = updated.findIndex((p) => p.itemId === data.itemId || p.keyword === data.keyword);
+        if (idx >= 0) {
+          updated[idx] = {
+            ...updated[idx],
+            status: 'completed',
+            itemId: data.itemId,
+            articleId: data.articleId,
+            title: data.title,
+            wordCount: data.wordCount,
+          };
+        }
+        return updated;
+      });
+    });
+
+    es.addEventListener('item_failed', (e) => {
+      const data = JSON.parse(e.data);
+      setProgress((prev) => {
+        const updated = [...prev];
+        const idx = updated.findIndex((p) => p.itemId === data.itemId || p.keyword === data.keyword);
+        if (idx >= 0) {
+          updated[idx] = {
+            ...updated[idx],
+            status: data.status || 'failed',
+            itemId: data.itemId,
+            error: data.error,
+          };
+        }
+        return updated;
+      });
+    });
+
+    es.addEventListener('job_progress', (e) => {
+      // Progress data received — counts update via item events
+    });
+
+    es.addEventListener('job_done', (e) => {
+      const data = JSON.parse(e.data);
+      setJobStatus(data.status);
+      setGenerating(false);
+      localStorage.removeItem(STORAGE_KEY);
+      es.close();
+      eventSourceRef.current = null;
+
+      if (data.status === 'completed') {
+        addToast(`Generation complete! ${data.completed} of ${data.total} articles succeeded.`);
+      } else if (data.status === 'canceled') {
+        addToast('Generation was canceled.', 'warning');
+      }
+    });
+
+    es.onerror = () => {
+      // EventSource will auto-reconnect; if fatal, just close
+      es.close();
+      eventSourceRef.current = null;
+      setGenerating(false);
+    };
+  };
+
+  const resumeJob = async (jid) => {
+    try {
+      const res = await fetch(`/api/generate/status/${jid}`);
+      if (!res.ok) {
+        localStorage.removeItem(STORAGE_KEY);
+        return;
+      }
+      const data = await res.json();
+      setJobId(jid);
+      setTotal(data.total);
+      setJobStatus(data.status);
+
+      // Rebuild progress from items
+      const items = data.items || [];
+      setProgress(items.map((it) => ({
+        itemId: it.id,
+        keyword: it.keyword,
+        status: it.status,
+        articleId: it.article_id,
+        error: it.error_message,
+      })));
+
+      if (data.status === 'running') {
+        setGenerating(true);
+        connectSSE(jid);
+      } else {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  };
 
   const handleGenerate = async (e) => {
     e.preventDefault();
@@ -72,14 +208,14 @@ export default function Generator() {
     }
 
     setGenerating(true);
-    setProgress([]);
-    setCurrentIndex(0);
+    setJobStatus('running');
     setTotal(keywordList.length);
 
     // Initialize progress items
     const initialProgress = keywordList.map((kw) => ({
       keyword: kw,
       status: 'waiting',
+      itemId: null,
     }));
     setProgress(initialProgress);
 
@@ -97,52 +233,32 @@ export default function Generator() {
         }),
       });
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const event = JSON.parse(line.slice(6));
-              if (event.type === 'progress') {
-                setCurrentIndex(event.current);
-                setProgress((prev) => {
-                  const updated = [...prev];
-                  const idx = updated.findIndex((p) => p.keyword === event.keyword);
-                  if (idx >= 0) {
-                    updated[idx] = {
-                      ...updated[idx],
-                      status: event.status,
-                      title: event.title,
-                      error: event.error,
-                      wordCount: event.wordCount,
-                    };
-                  }
-                  return updated;
-                });
-              } else if (event.type === 'done') {
-                addToast(`Generation complete! ${event.total} articles processed.`);
-              } else if (event.type === 'error') {
-                addToast(event.error, 'error');
-              }
-            } catch {}
-          }
-        }
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Generation request failed');
       }
+
+      const { jobId: jid } = await response.json();
+      setJobId(jid);
+      localStorage.setItem(STORAGE_KEY, String(jid));
+
+      // Connect SSE stream
+      connectSSE(jid);
     } catch (err) {
       addToast('Generation failed: ' + err.message, 'error');
+      setGenerating(false);
+      setJobStatus(null);
     }
+  };
 
-    setGenerating(false);
+  const handleCancel = async () => {
+    if (!jobId) return;
+    try {
+      await fetch(`/api/generate/cancel/${jobId}`, { method: 'POST' });
+      // SSE events will handle the rest
+    } catch {
+      addToast('Failed to cancel', 'error');
+    }
   };
 
   const statusIcon = (status) => {
@@ -151,12 +267,15 @@ export default function Generator() {
       case 'generating': return '🔄';
       case 'completed': return '✅';
       case 'failed': return '❌';
+      case 'canceled': return '🚫';
       default: return '⏳';
     }
   };
 
   const completedCount = progress.filter((p) => p.status === 'completed').length;
   const failedCount = progress.filter((p) => p.status === 'failed').length;
+  const canceledCount = progress.filter((p) => p.status === 'canceled').length;
+  const doneCount = completedCount + failedCount + canceledCount;
 
   return (
     <div>
@@ -244,6 +363,16 @@ export default function Generator() {
           >
             {generating ? '⏳ Generating...' : '🚀 Generate Articles'}
           </button>
+
+          {generating && (
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="w-full mt-2 bg-red-600 hover:bg-red-700 text-white rounded-lg py-2 text-sm font-medium transition-colors"
+            >
+              🚫 Cancel Generation
+            </button>
+          )}
         </form>
 
         {/* Progress Panel */}
@@ -255,15 +384,22 @@ export default function Generator() {
               {/* Progress bar */}
               <div className="mb-4">
                 <div className="flex justify-between text-sm text-secondary mb-1">
-                  <span>{completedCount + failedCount} of {total} completed</span>
-                  <span>{completedCount} ✅ {failedCount > 0 && `${failedCount} ❌`}</span>
+                  <span>{doneCount} of {total} processed</span>
+                  <span>
+                    {completedCount} ✅
+                    {failedCount > 0 && ` ${failedCount} ❌`}
+                    {canceledCount > 0 && ` ${canceledCount} 🚫`}
+                  </span>
                 </div>
                 <div className="w-full bg-gray-700 rounded-full h-2">
                   <div
                     className="bg-accent-green rounded-full h-2 transition-all duration-500"
-                    style={{ width: `${((completedCount + failedCount) / total) * 100}%` }}
+                    style={{ width: `${(doneCount / total) * 100}%` }}
                   />
                 </div>
+                {jobStatus && jobStatus !== 'running' && (
+                  <p className="text-xs text-muted mt-1 capitalize">Job {jobStatus}</p>
+                )}
               </div>
 
               {/* Keyword list */}

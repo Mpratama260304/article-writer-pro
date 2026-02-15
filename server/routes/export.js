@@ -16,7 +16,11 @@ router.post('/wordpress/:projectId', (req, res) => {
 
     if (articles.length === 0) return res.status(400).json({ error: 'No completed articles to export' });
 
-    const xml = generateWordPressXML(articles, project.name);
+    // Resolve language from first article or settings
+    const langRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('default_language');
+    const language = (articles[0] && articles[0].language) || (langRow && langRow.value) || 'Indonesian';
+
+    const xml = generateWordPressXML(articles, project.name, language);
     const filename = `${project.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()}-wordpress.xml`;
 
     res.setHeader('Content-Type', 'application/xml');

@@ -1,0 +1,11 @@
+services:
+  articlewriterpro:
+    image: mpratamamail/article-writer-pro:latest
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./database:/app/database
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    restart: unless-stopped

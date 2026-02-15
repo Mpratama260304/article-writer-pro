@@ -3,6 +3,7 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import db from './database.js';
 import projectsRouter from './routes/projects.js';
 import articlesRouter from './routes/articles.js';
 import generatorRouter from './routes/generator.js';
@@ -31,6 +32,16 @@ app.use('/api/templates', templatesRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/export', exportRouter);
 app.use('/api/dashboard', dashboardRouter);
+
+// Health check
+app.get('/api/health', (req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    res.json({ ok: true, uptime: process.uptime(), db: 'ok' });
+  } catch (err) {
+    res.status(503).json({ ok: false, uptime: process.uptime(), db: err.message });
+  }
+});
 
 // Serve static files in production
 if (process.env.NODE_ENV === 'production') {
