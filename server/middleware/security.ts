@@ -26,18 +26,39 @@ export function corsMiddleware(): RequestHandler {
     ...(config.isProduction ? [] : DEV_ORIGINS),
   ]);
 
-  const options: CorsOptions = {
-    origin(origin, callback) {
-      if (!origin || allowlist.has(origin)) {
-        callback(null, true);
+  return cors((req, callback) => {
+    const origin = req.headers.origin;
+    const base: CorsOptions = { credentials: true };
+
+    // No Origin header (curl, health checks, same-origin GET) → allow.
+    if (!origin) {
+      callback(null, { ...base, origin: true });
+      return;
+    }
+
+    // Explicitly allowlisted origin → allow.
+    if (allowlist.has(origin)) {
+      callback(null, { ...base, origin: true });
+      return;
+    }
+
+    // Same-origin request: the bundled SPA is served from the same host as the
+    // API (e.g. the Railway public domain). Browsers still send an `Origin`
+    // header on non-GET requests, so allow it when the origin host matches the
+    // request host.
+    try {
+      if (req.headers.host && new URL(origin).host === req.headers.host) {
+        callback(null, { ...base, origin: true });
         return;
       }
-      callback(new Error('Not allowed by CORS'));
-    },
-    credentials: true,
-  };
+    } catch {
+      // Malformed Origin header → fall through to reject.
+    }
 
-  return cors(options);
+    // Disallowed cross-origin request: omit CORS headers instead of throwing,
+    // so the request is not turned into a server-side 500.
+    callback(null, { ...base, origin: false });
+  });
 }
 
 /** Security headers. CSP is relaxed for the bundled SPA assets. */
