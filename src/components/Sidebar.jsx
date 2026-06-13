@@ -1,5 +1,7 @@
 import { NavLink } from 'react-router-dom';
 
+import { useAuth } from '../context/AuthContext';
+
 const navItems = [
   { to: '/', label: 'Dashboard', icon: '⊙' },
   { to: '/projects', label: 'Projects', icon: '📁' },
@@ -11,6 +13,7 @@ const navItems = [
 ];
 
 export default function Sidebar({ collapsed, onToggle }) {
+  const { user, logout } = useAuth();
   return (
     <>
       {/* Mobile overlay */}
@@ -57,8 +60,20 @@ export default function Sidebar({ collapsed, onToggle }) {
         </nav>
 
         {/* Footer */}
-        <div className="px-5 py-4 text-xs text-muted">
-          v1.0.0 • Portable Edition
+        <div className="px-3 py-4 space-y-3">
+          {user && (
+            <div className="px-2 text-xs text-secondary truncate">
+              Signed in as <span className="text-white">{user.username}</span>
+            </div>
+          )}
+          <button
+            onClick={logout}
+            className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-secondary hover:text-white w-full transition-colors"
+          >
+            <span className="text-lg">⏻</span>
+            <span>Logout</span>
+          </button>
+          <div className="px-2 text-xs text-muted">v2.0.0</div>
         </div>
       </aside>
     </>

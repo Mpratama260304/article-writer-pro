@@ -41,8 +41,8 @@ export const setupSchema = z.object({
   aiBaseUrl: httpUrlSchema,
   aiModel: nonEmptyString(100),
   aiApiKey: nonEmptyString(500),
-  defaultLanguage: nonEmptyString(50).default('English'),
-  defaultTone: nonEmptyString(50).default('informational'),
+  defaultLanguage: nonEmptyString(50),
+  defaultTone: nonEmptyString(50),
 });
 
 export type SetupInput = z.infer<typeof setupSchema>;
@@ -54,6 +54,34 @@ export const loginSchema = z.object({
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;
+
+/**
+ * Settings update payload. All fields optional (partial update). `ai_api_key`
+ * is special: an empty/absent value means "keep the existing key".
+ */
+export const settingsUpdateSchema = z.object({
+  ai_provider_name: optionalString(50),
+  ai_base_url: z.string().trim().max(500).optional(),
+  ai_model: optionalString(100),
+  ai_api_key: z.string().max(500).optional(),
+  max_tokens: z.coerce.number().int().min(256).max(64000).optional(),
+  temperature: z.coerce.number().min(0).max(2).optional(),
+  default_language: optionalString(50),
+  default_tone: optionalString(50),
+  rate_limit_ms: z.coerce.number().int().min(0).max(60000).optional(),
+  concurrency: z.coerce.number().int().min(1).max(20).optional(),
+});
+
+export type SettingsUpdateInput = z.infer<typeof settingsUpdateSchema>;
+
+/** Optional unsaved AI config for the "test connection" endpoint. */
+export const testConnectionSchema = z.object({
+  ai_base_url: z.string().trim().max(500).optional(),
+  ai_model: optionalString(100),
+  ai_api_key: z.string().max(500).optional(),
+});
+
+export type TestConnectionInput = z.infer<typeof testConnectionSchema>;
 
 /**
  * Validate `data` against `schema`, throwing a 400-tagged error with a safe,

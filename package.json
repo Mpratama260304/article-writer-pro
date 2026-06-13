@@ -11,11 +11,13 @@
     "start": "NODE_ENV=production tsx server/index.ts",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node tests/sanity.test.js"
+    "test": "tsx tests/sanity.test.js && tsx tests/phase2.test.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",
+    "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.7.0",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "express": "^4.21.1",
     "express-rate-limit": "^7.4.1",
@@ -28,7 +30,9 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6.11",
+    "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^22.10.1",

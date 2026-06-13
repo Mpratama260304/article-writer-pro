@@ -1,11 +1,13 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import cookieParser from 'cookie-parser';
 import express from 'express';
 
 import { config } from './config/index.js';
 import db from './database.js';
 import { getAppSecret } from './lib/appSecret.js';
+import { optionalAuth, requireAuth } from './middleware/auth.js';
 import {
   corsMiddleware,
   errorHandler,
@@ -13,13 +15,16 @@ import {
   helmetMiddleware,
   notFoundHandler,
 } from './middleware/security.js';
+import { ensureSetupToken } from './services/setup-service.js';
 import articlesRouter from './routes/articles.js';
+import authRouter from './routes/auth.js';
 import dashboardRouter from './routes/dashboard.js';
 import exportRouter from './routes/export.js';
 import generatorRouter from './routes/generator.js';
 import projectsRouter from './routes/projects.js';
 import promptsRouter from './routes/prompts.js';
 import settingsRouter from './routes/settings.js';
+import setupRouter from './routes/setup.js';
 import templatesRouter from './routes/templates.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -38,29 +43,35 @@ if (config.trustProxy) {
 app.use(helmetMiddleware());
 app.use(corsMiddleware());
 app.use(express.json({ limit: config.bodyLimit }));
+app.use(cookieParser());
 app.use('/api', globalRateLimiter());
+app.use(optionalAuth);
 
-// ── Health check ──
+// ── Health check (public) ──
 app.get('/api/health', (_req, res) => {
   try {
     db.prepare('SELECT 1').get();
     res.json({ ok: true, uptime: process.uptime(), db: 'ok' });
-  } catch (err) {
+  } catch {
     res.status(503).json({ ok: false, uptime: process.uptime(), db: 'error' });
   }
 });
 
-// ── API routes ──
-app.use('/api/projects', projectsRouter);
-app.use('/api/articles', articlesRouter);
-app.use('/api/generate', generatorRouter);
-app.use('/api/prompts', promptsRouter);
-app.use('/api/templates', templatesRouter);
-app.use('/api/settings', settingsRouter);
-app.use('/api/export', exportRouter);
-app.use('/api/dashboard', dashboardRouter);
+// ── Public routes: setup + auth ──
+app.use('/api/setup', setupRouter);
+app.use('/api/auth', authRouter);
 
-// Unknown API routes -> JSON 404 (must be before the SPA catch-all).
+// ── Protected routes (admin session required) ──
+app.use('/api/projects', requireAuth, projectsRouter);
+app.use('/api/articles', requireAuth, articlesRouter);
+app.use('/api/generate', requireAuth, generatorRouter);
+app.use('/api/prompts', requireAuth, promptsRouter);
+app.use('/api/templates', requireAuth, templatesRouter);
+app.use('/api/settings', requireAuth, settingsRouter);
+app.use('/api/export', requireAuth, exportRouter);
+app.use('/api/dashboard', requireAuth, dashboardRouter);
+
+// Unknown API routes -> JSON 404 (before the SPA catch-all).
 app.use('/api', notFoundHandler);
 
 // ── Serve the built SPA in production ──
@@ -78,6 +89,8 @@ app.use(errorHandler);
 app.listen(config.port, () => {
   // eslint-disable-next-line no-console
   console.log(`ArticleWriterPro server running on http://localhost:${config.port}`);
+  // Print the first-run setup URL/token when setup is required.
+  ensureSetupToken();
 });
 
 export default app;

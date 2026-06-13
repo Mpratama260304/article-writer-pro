@@ -1,13 +1,14 @@
 import { Router } from 'express';
 import db from '../database.js';
 import { generateArticle } from '../services/ai-service.js';
+import { getAiSettingsForServerUse } from '../services/settings-service.js';
 
 const router = Router();
 
 // In-memory map of running jobs for cancellation signaling
 const runningJobs = new Map(); // jobId -> { canceled: bool }
 
-// ── Helper: load settings from DB ──
+// ── Helper: load non-secret settings (for defaults) ──
 function loadSettings() {
   const settings = {};
   const rows = db.prepare('SELECT key, value FROM settings').all();
@@ -24,21 +25,23 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'projectId and keywords are required' });
     }
 
-    // Resolve prompt template
+    // Resolve prompt template (canonical prompt_templates table)
     let promptTemplate;
     if (promptId) {
-      const prompt = db.prepare('SELECT template FROM prompts WHERE id = ?').get(promptId);
+      const prompt = db.prepare('SELECT template FROM prompt_templates WHERE id = ?').get(promptId);
       promptTemplate = prompt ? prompt.template : null;
     }
     if (!promptTemplate) {
-      const defaultPrompt = db.prepare('SELECT template FROM prompts WHERE is_default = 1').get();
+      const defaultPrompt = db
+        .prepare('SELECT template FROM prompt_templates WHERE is_default = 1')
+        .get();
       promptTemplate = defaultPrompt
         ? defaultPrompt.template
         : 'Write an article about "{keyword}" in {language} with a {tone} tone.';
     }
 
     const settings = loadSettings();
-    const lang = language || settings.default_language || 'Indonesian';
+    const lang = language || settings.default_language || 'English';
     const articleTone = tone || settings.default_tone || 'informational';
     const articleLength = length || 'medium';
 
@@ -50,13 +53,13 @@ router.post('/', async (req, res) => {
 
     // Create job row
     const jobResult = db
-      .prepare('INSERT INTO jobs (project_id, status, total) VALUES (?, ?, ?)')
+      .prepare('INSERT INTO generation_jobs (project_id, status, total) VALUES (?, ?, ?)')
       .run(projectId, 'running', cleanKeywords.length);
     const jobId = jobResult.lastInsertRowid;
 
     // Create job_items rows
     const insertItem = db.prepare(
-      'INSERT INTO job_items (job_id, keyword, status) VALUES (?, ?, ?)'
+      'INSERT INTO generation_job_items (job_id, keyword, status) VALUES (?, ?, ?)'
     );
     for (const kw of cleanKeywords) {
       insertItem.run(jobId, kw, 'waiting');
@@ -70,17 +73,19 @@ router.post('/', async (req, res) => {
     res.json({ jobId: Number(jobId) });
 
     // ── Background processing (fire-and-forget) ──
+    // AI config is loaded SERVER-SIDE with the decrypted API key.
+    const ai = getAiSettingsForServerUse();
     const aiConfig = {
-      apiBaseUrl: settings.api_base_url,
-      apiKey: settings.api_key,
-      model: settings.model,
-      maxTokens: parseInt(settings.max_tokens) || 4096,
-      temperature: parseFloat(settings.temperature) || 0.7,
+      apiBaseUrl: ai.baseUrl,
+      apiKey: ai.apiKey,
+      model: ai.model,
+      maxTokens: ai.maxTokens,
+      temperature: ai.temperature,
     };
-    const rateLimitMs = parseInt(settings.rate_limit_ms) || 2000;
+    const rateLimitMs = ai.rateLimitMs;
 
     const items = db
-      .prepare("SELECT * FROM job_items WHERE job_id = ? AND status = 'waiting' ORDER BY id")
+      .prepare("SELECT * FROM generation_job_items WHERE job_id = ? AND status = 'waiting' ORDER BY id")
       .all(jobId);
 
     let completedCount = 0;
@@ -91,7 +96,7 @@ router.post('/', async (req, res) => {
       if (jobHandle.canceled) {
         // Mark remaining items as canceled
         db.prepare(
-          "UPDATE job_items SET status = 'canceled', finished_at = CURRENT_TIMESTAMP WHERE job_id = ? AND status = 'waiting'"
+          "UPDATE generation_job_items SET status = 'canceled', finished_at = CURRENT_TIMESTAMP WHERE job_id = ? AND status = 'waiting'"
         ).run(jobId);
         break;
       }
@@ -100,7 +105,7 @@ router.post('/', async (req, res) => {
 
       // Mark item as generating
       db.prepare(
-        "UPDATE job_items SET status = 'generating', started_at = CURRENT_TIMESTAMP WHERE id = ?"
+        "UPDATE generation_job_items SET status = 'generating', started_at = CURRENT_TIMESTAMP WHERE id = ?"
       ).run(item.id);
 
       try {
@@ -108,45 +113,53 @@ router.post('/', async (req, res) => {
           item.keyword, promptTemplate, lang, articleTone, articleLength, aiConfig
         );
 
-        // Insert article
+        // Insert article (populate both legacy + v2 columns)
         const artResult = db.prepare(
-          `INSERT INTO articles (project_id, keyword, title, content, slug, excerpt, tags, word_count, language, tone, status, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)`
+          `INSERT INTO articles
+             (project_id, keyword, title, content, content_html, slug, excerpt, tags, tags_json,
+              word_count, language, tone, status, ai_provider, ai_model, prompt_id, generation_job_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, CURRENT_TIMESTAMP)`
         ).run(
           projectId,
           item.keyword,
           result.title || item.keyword,
           result.content,
+          result.content,
           result.slug,
           result.excerpt,
           JSON.stringify(result.tags || []),
+          JSON.stringify(result.tags || []),
           result.wordCount,
           lang,
-          articleTone
+          articleTone,
+          ai.providerName || '',
+          ai.model || '',
+          promptId || null,
+          Number(jobId)
         );
 
         // Update job_item
         db.prepare(
-          "UPDATE job_items SET status = 'completed', article_id = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?"
+          "UPDATE generation_job_items SET status = 'completed', article_id = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?"
         ).run(artResult.lastInsertRowid, item.id);
 
         completedCount++;
       } catch (err) {
         // Insert article in failed state
         const artResult = db.prepare(
-          `INSERT INTO articles (project_id, keyword, status, error_message, language, tone, updated_at)
-           VALUES (?, ?, 'failed', ?, ?, ?, CURRENT_TIMESTAMP)`
-        ).run(projectId, item.keyword, err.message, lang, articleTone);
+          `INSERT INTO articles (project_id, keyword, status, error_message, language, tone, generation_job_id, updated_at)
+           VALUES (?, ?, 'failed', ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+        ).run(projectId, item.keyword, err.message, lang, articleTone, Number(jobId));
 
         db.prepare(
-          "UPDATE job_items SET status = 'failed', article_id = ?, error_message = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?"
+          "UPDATE generation_job_items SET status = 'failed', article_id = ?, error_message = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?"
         ).run(artResult.lastInsertRowid, err.message, item.id);
 
         failedCount++;
       }
 
       // Update job aggregate
-      db.prepare('UPDATE jobs SET completed = ?, failed = ? WHERE id = ?').run(
+      db.prepare('UPDATE generation_jobs SET completed = ?, failed = ? WHERE id = ?').run(
         completedCount, failedCount, jobId
       );
 
@@ -158,7 +171,7 @@ router.post('/', async (req, res) => {
 
     // Finalize job status
     const finalStatus = jobHandle.canceled ? 'canceled' : 'completed';
-    db.prepare('UPDATE jobs SET status = ?, completed = ?, failed = ? WHERE id = ?').run(
+    db.prepare('UPDATE generation_jobs SET status = ?, completed = ?, failed = ? WHERE id = ?').run(
       finalStatus, completedCount, failedCount, jobId
     );
 
@@ -173,7 +186,7 @@ router.post('/', async (req, res) => {
 // ── GET /api/generate/stream/:jobId — SSE event stream ──
 router.get('/stream/:jobId', (req, res) => {
   const jobId = parseInt(req.params.jobId);
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  const job = db.prepare('SELECT * FROM generation_jobs WHERE id = ?').get(jobId);
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
@@ -190,7 +203,7 @@ router.get('/stream/:jobId', (req, res) => {
   };
 
   // Send initial job state
-  const items = db.prepare('SELECT * FROM job_items WHERE job_id = ? ORDER BY id').all(jobId);
+  const items = db.prepare('SELECT * FROM generation_job_items WHERE job_id = ? ORDER BY id').all(jobId);
   sendSSE('job_started', { jobId, total: job.total, status: job.status });
 
   // Send current state of all items
@@ -228,7 +241,7 @@ router.get('/stream/:jobId', (req, res) => {
 
   const pollInterval = setInterval(() => {
     try {
-      const currentJob = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+      const currentJob = db.prepare('SELECT * FROM generation_jobs WHERE id = ?').get(jobId);
       if (!currentJob) {
         clearInterval(pollInterval);
         res.end();
@@ -236,7 +249,7 @@ router.get('/stream/:jobId', (req, res) => {
       }
 
       // Check for item status changes
-      const currentItems = db.prepare('SELECT * FROM job_items WHERE job_id = ? ORDER BY id').all(jobId);
+      const currentItems = db.prepare('SELECT * FROM generation_job_items WHERE job_id = ? ORDER BY id').all(jobId);
       for (const item of currentItems) {
         const prevStatus = lastItemStatuses[item.id];
         if (prevStatus !== item.status) {
@@ -310,7 +323,7 @@ router.get('/stream/:jobId', (req, res) => {
 // ── POST /api/generate/cancel/:jobId ──
 router.post('/cancel/:jobId', (req, res) => {
   const jobId = parseInt(req.params.jobId);
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  const job = db.prepare('SELECT * FROM generation_jobs WHERE id = ?').get(jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'running') return res.json({ success: true, message: 'Job already ' + job.status });
 
@@ -319,9 +332,9 @@ router.post('/cancel/:jobId', (req, res) => {
   if (handle) handle.canceled = true;
 
   // Update DB
-  db.prepare("UPDATE jobs SET status = 'canceled' WHERE id = ?").run(jobId);
+  db.prepare("UPDATE generation_jobs SET status = 'canceled' WHERE id = ?").run(jobId);
   db.prepare(
-    "UPDATE job_items SET status = 'canceled', finished_at = CURRENT_TIMESTAMP WHERE job_id = ? AND status IN ('waiting','generating')"
+    "UPDATE generation_job_items SET status = 'canceled', finished_at = CURRENT_TIMESTAMP WHERE job_id = ? AND status IN ('waiting','generating')"
   ).run(jobId);
 
   res.json({ success: true });
@@ -330,11 +343,11 @@ router.post('/cancel/:jobId', (req, res) => {
 // ── GET /api/generate/status/:jobId — poll-based status ──
 router.get('/status/:jobId', (req, res) => {
   const jobId = parseInt(req.params.jobId);
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  const job = db.prepare('SELECT * FROM generation_jobs WHERE id = ?').get(jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
   const items = db
-    .prepare('SELECT id, keyword, status, article_id, error_message, started_at, finished_at FROM job_items WHERE job_id = ? ORDER BY id')
+    .prepare('SELECT id, keyword, status, article_id, error_message, started_at, finished_at FROM generation_job_items WHERE job_id = ? ORDER BY id')
     .all(jobId);
 
   res.json({ ...job, items });
